@@ -153,6 +153,14 @@ func (oc *OvsController) validateNetworkConfig(clusterNetworkCIDR, serviceNetwor
 	return kerrors.NewAggregate(errList)
 }
 
+func watchGetNodes(registry api.SubnetRegistry) (interface{}, string, error) {
+	return registry.GetNodes()
+}
+
+func watchGetNamespaces(registry api.SubnetRegistry) (interface{}, string, error) {
+	return registry.GetNamespaces()
+}
+
 func (oc *OvsController) StartMaster(clusterNetworkCIDR string, clusterBitsPerSubnet uint, serviceNetworkCIDR string) error {
 	subrange := make([]string, 0)
 	subnets, _, err := oc.subnetRegistry.GetSubnets()
@@ -184,7 +192,7 @@ func (oc *OvsController) StartMaster(clusterNetworkCIDR string, clusterBitsPerSu
 		return err
 	}
 
-	result, err := oc.watchAndGetResource("Node")
+	result, err := oc.watchAndGetResource("Node", watchNodes, watchGetNodes)
 	if err != nil {
 		return err
 	}
@@ -213,7 +221,7 @@ func (oc *OvsController) StartMaster(clusterNetworkCIDR string, clusterBitsPerSu
 			return err
 		}
 
-		result, err := oc.watchAndGetResource("Namespace")
+		result, err := oc.watchAndGetResource("Namespace", watchNamespaces, watchGetNamespaces)
 		if err != nil {
 			return err
 		}
@@ -314,7 +322,7 @@ func (oc *OvsController) revokeVNID(namespaceName string) error {
 	return nil
 }
 
-func (oc *OvsController) watchNetworks(ready chan<- bool, start <-chan string) {
+func watchNamespaces(oc *OvsController, ready chan<- bool, start <-chan string) {
 	nsevent := make(chan *api.NamespaceEvent)
 	stop := make(chan bool)
 	go oc.subnetRegistry.WatchNamespaces(nsevent, ready, start, stop)
@@ -396,6 +404,18 @@ func (oc *OvsController) DeleteNode(nodeName string) error {
 	return oc.subnetRegistry.DeleteSubnet(nodeName)
 }
 
+func watchGetSubnets(registry api.SubnetRegistry) (interface{}, string, error) {
+	return registry.GetSubnets()
+}
+
+func watchGetNetNamespaces(registry api.SubnetRegistry) (interface{}, string, error) {
+	return registry.GetNetNamespaces()
+}
+
+func watchGetServices(registry api.SubnetRegistry) (interface{}, string, error) {
+	return registry.GetServices()
+}
+
 func (oc *OvsController) StartNode(mtu uint) error {
 	err := oc.initSelfSubnet()
 	if err != nil {
@@ -432,7 +452,7 @@ func (oc *OvsController) StartNode(mtu uint) error {
 		}
 	})
 
-	result, err := oc.watchAndGetResource("HostSubnet")
+	result, err := oc.watchAndGetResource("HostSubnet", watchSubnets, watchGetSubnets)
 	if err != nil {
 		return err
 	}
@@ -441,7 +461,7 @@ func (oc *OvsController) StartNode(mtu uint) error {
 		oc.flowController.AddOFRules(s.NodeIP, s.SubnetCIDR, oc.localIP)
 	}
 	if oc.isMultitenant() {
-		result, err := oc.watchAndGetResource("NetNamespace")
+		result, err := oc.watchAndGetResource("NetNamespace", watchNetNamespaces, watchGetNetNamespaces)
 		if err != nil {
 			return err
 		}
@@ -450,7 +470,7 @@ func (oc *OvsController) StartNode(mtu uint) error {
 			oc.VNIDMap[ns.Name] = ns.NetID
 		}
 
-		result, err = oc.watchAndGetResource("Service")
+		result, err = oc.watchAndGetResource("Service", watchServices, watchGetServices)
 		if err != nil {
 			return err
 		}
@@ -495,7 +515,7 @@ func (oc *OvsController) updatePodNetwork(namespace string, netID, oldNetID uint
 	return nil
 }
 
-func (oc *OvsController) watchVnids(ready chan<- bool, start <-chan string) {
+func watchNetNamespaces(oc *OvsController, ready chan<- bool, start <-chan string) {
 	stop := make(chan bool)
 	netNsEvent := make(chan *api.NetNamespaceEvent)
 	go oc.subnetRegistry.WatchNetNamespaces(netNsEvent, ready, start, stop)
@@ -546,7 +566,7 @@ func (oc *OvsController) initSelfSubnet() error {
 	}
 }
 
-func (oc *OvsController) watchNodes(ready chan<- bool, start <-chan string) {
+func watchNodes(oc *OvsController, ready chan<- bool, start <-chan string) {
 	stop := make(chan bool)
 	nodeEvent := make(chan *api.NodeEvent)
 	go oc.subnetRegistry.WatchNodes(nodeEvent, ready, start, stop)
@@ -587,7 +607,7 @@ func (oc *OvsController) watchNodes(ready chan<- bool, start <-chan string) {
 	}
 }
 
-func (oc *OvsController) watchServices(ready chan<- bool, start <-chan string) {
+func watchServices(oc *OvsController, ready chan<- bool, start <-chan string) {
 	stop := make(chan bool)
 	svcevent := make(chan *api.ServiceEvent)
 	go oc.subnetRegistry.WatchServices(svcevent, ready, start, stop)
@@ -612,7 +632,7 @@ func (oc *OvsController) watchServices(ready chan<- bool, start <-chan string) {
 	}
 }
 
-func (oc *OvsController) watchCluster(ready chan<- bool, start <-chan string) {
+func watchSubnets(oc *OvsController, ready chan<- bool, start <-chan string) {
 	stop := make(chan bool)
 	clusterEvent := make(chan *api.SubnetEvent)
 	go oc.subnetRegistry.WatchSubnets(clusterEvent, ready, start, stop)
@@ -672,6 +692,9 @@ func waitForWatchReadiness(ready chan bool, resourceName string) {
 	return
 }
 
+type watchWatcher func(oc *OvsController, ready chan<- bool, start <-chan string)
+type watchGetter  func(registry api.SubnetRegistry) (interface{}, string, error)
+
 // watchAndGetResource will fetch current items in etcd and watch for any new
 // changes for the given resource.
 // Supported resources: nodes, subnets, namespaces, services, netnamespaces, and pods.
@@ -687,38 +710,13 @@ func waitForWatchReadiness(ready chan bool, resourceName string) {
 // 6. Initiator: Send version from step-5 to WatchProcess
 // 7. WatchProcess: Ignore any items with version <= start version got from initiator on step-6
 // 8. WatchProcess: Handle new changes
-func (oc *OvsController) watchAndGetResource(resourceName string) (interface{}, error) {
+func (oc *OvsController) watchAndGetResource(resourceName string, watcher watchWatcher, getter watchGetter) (interface{}, error) {
 	ready := make(chan bool)
 	start := make(chan string)
 
-	var getOutput interface{}
-	var version string
-	var err error
-
-	switch strings.ToLower(resourceName) {
-	case "hostsubnet":
-		go oc.watchCluster(ready, start)
-		waitForWatchReadiness(ready, resourceName)
-		getOutput, version, err = oc.subnetRegistry.GetSubnets()
-	case "node":
-		go oc.watchNodes(ready, start)
-		waitForWatchReadiness(ready, resourceName)
-		getOutput, version, err = oc.subnetRegistry.GetNodes()
-	case "namespace":
-		go oc.watchNetworks(ready, start)
-		waitForWatchReadiness(ready, resourceName)
-		getOutput, version, err = oc.subnetRegistry.GetNamespaces()
-	case "netnamespace":
-		go oc.watchVnids(ready, start)
-		waitForWatchReadiness(ready, resourceName)
-		getOutput, version, err = oc.subnetRegistry.GetNetNamespaces()
-	case "service":
-		go oc.watchServices(ready, start)
-		waitForWatchReadiness(ready, resourceName)
-		getOutput, version, err = oc.subnetRegistry.GetServices()
-	default:
-		log.Fatalf("Unknown resource %s for watch and get resource", resourceName)
-	}
+	go watcher(oc, ready, start)
+	waitForWatchReadiness(ready, strings.ToLower(resourceName))
+	getOutput, version, err := getter(oc.subnetRegistry)
 	if err != nil {
 		return nil, err
 	}
