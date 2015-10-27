@@ -19,6 +19,7 @@ type SubnetRegistry interface {
 
 	WriteNetworkConfig(clusterNetworkCIDR string, clusterBitsPerSubnet uint, serviceNetworkCIDR string) error
 	GetClusterNetworkCIDR() (string, error)
+	GetHostSubnetLength() (int, error)
 
 	GetNamespaces() ([]string, string, error)
 	WatchNamespaces(receiver chan<- *NamespaceEvent, ready chan<- bool, startVersion <-chan string, stop <-chan bool) error
