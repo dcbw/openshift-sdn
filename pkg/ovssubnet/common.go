@@ -462,11 +462,6 @@ func (oc *OvsController) StartNode(mtu uint) error {
 			}
 			oc.flowController.AddServiceOFRules(netid, svc.IP, svc.Protocol, svc.Port)
 		}
-
-		_, err = oc.watchAndGetResource("Pod")
-		if err != nil {
-			return err
-		}
 	}
 
 	if oc.ready != nil {
@@ -617,15 +612,6 @@ func (oc *OvsController) watchServices(ready chan<- bool, start <-chan string) {
 	}
 }
 
-func (oc *OvsController) watchPods(ready chan<- bool, start <-chan string) {
-	stop := make(chan bool)
-	go oc.subnetRegistry.WatchPods(ready, start, stop)
-
-	<-oc.sig
-	log.Error("Signal received. Stopping watching of pods.")
-	stop <- true
-}
-
 func (oc *OvsController) watchCluster(ready chan<- bool, start <-chan string) {
 	stop := make(chan bool)
 	clusterEvent := make(chan *api.SubnetEvent)
@@ -730,10 +716,6 @@ func (oc *OvsController) watchAndGetResource(resourceName string) (interface{}, 
 		go oc.watchServices(ready, start)
 		waitForWatchReadiness(ready, resourceName)
 		getOutput, version, err = oc.subnetRegistry.GetServices()
-	case "pod":
-		go oc.watchPods(ready, start)
-		waitForWatchReadiness(ready, resourceName)
-		getOutput, version, err = oc.subnetRegistry.GetPods()
 	default:
 		log.Fatalf("Unknown resource %s for watch and get resource", resourceName)
 	}
