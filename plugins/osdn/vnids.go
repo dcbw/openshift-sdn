@@ -23,7 +23,7 @@ const (
 	AdminVNID = uint(0)
 )
 
-func (oc *OsdnController) VnidStartMaster() error {
+func (oc *OsdnMaster) VnidStartMaster() error {
 	err := oc.vnidMap.PopulateVNIDs(oc.Registry)
 	if err != nil {
 		return err
@@ -43,7 +43,7 @@ func (oc *OsdnController) VnidStartMaster() error {
 	return nil
 }
 
-func (oc *OsdnController) isAdminNamespace(nsName string) bool {
+func (oc *OsdnMaster) isAdminNamespace(nsName string) bool {
 	for _, name := range oc.adminNamespaces {
 		if name == nsName {
 			return true
@@ -52,7 +52,7 @@ func (oc *OsdnController) isAdminNamespace(nsName string) bool {
 	return false
 }
 
-func (oc *OsdnController) assignVNID(namespaceName string) error {
+func (oc *OsdnMaster) assignVNID(namespaceName string) error {
 	// Nothing to do if the netid is in the vnid map
 	if _, err := oc.vnidMap.GetVNID(namespaceName); err == nil {
 		return nil
@@ -90,7 +90,7 @@ func (oc *OsdnController) assignVNID(namespaceName string) error {
 	return nil
 }
 
-func (oc *OsdnController) revokeVNID(namespaceName string) error {
+func (oc *OsdnMaster) revokeVNID(namespaceName string) error {
 	// Remove NetID from vnid map
 	netid_found := true
 	netid, err := oc.vnidMap.UnsetVNID(namespaceName)
@@ -126,7 +126,7 @@ func (oc *OsdnController) revokeVNID(namespaceName string) error {
 	return nil
 }
 
-func (oc *OsdnController) watchNamespaces() {
+func (oc *OsdnMaster) watchNamespaces() {
 	eventQueue := oc.Registry.RunEventQueue(Namespaces)
 
 	for {
@@ -155,7 +155,7 @@ func (oc *OsdnController) watchNamespaces() {
 	}
 }
 
-func (oc *OsdnController) VnidStartNode() error {
+func (oc *OsdnNode) VnidStartNode() error {
 	// Populate vnid map synchronously so that existing services can fetch vnid
 	err := oc.vnidMap.PopulateVNIDs(oc.Registry)
 	if err != nil {
@@ -167,7 +167,7 @@ func (oc *OsdnController) VnidStartNode() error {
 	return nil
 }
 
-func (oc *OsdnController) updatePodNetwork(namespace string, netID uint) error {
+func (oc *OsdnNode) updatePodNetwork(namespace string, netID uint) error {
 	// Update OF rules for the existing/old pods in the namespace
 	pods, err := oc.GetLocalPods(namespace)
 	if err != nil {
@@ -197,7 +197,7 @@ func (oc *OsdnController) updatePodNetwork(namespace string, netID uint) error {
 	return kerrors.NewAggregate(errList)
 }
 
-func (oc *OsdnController) watchNetNamespaces() {
+func (oc *OsdnNode) watchNetNamespaces() {
 	eventQueue := oc.Registry.RunEventQueue(NetNamespaces)
 
 	for {
@@ -247,7 +247,7 @@ func isServiceChanged(oldsvc, newsvc *kapi.Service) bool {
 	return true
 }
 
-func (oc *OsdnController) watchServices() {
+func (oc *OsdnNode) watchServices() {
 	services := make(map[string]*kapi.Service)
 	eventQueue := oc.Registry.RunEventQueue(Services)
 

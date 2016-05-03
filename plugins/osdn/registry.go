@@ -279,3 +279,27 @@ func (registry *Registry) RunEventQueue(resourceName ResourceName) *oscache.Even
 	cache.NewReflector(lw, expectedType, eventQueue, 30*time.Minute).Run()
 	return eventQueue
 }
+
+func (registry *Registry) ValidateNodeIP(nodeIP string) error {
+	if nodeIP == "" || nodeIP == "127.0.0.1" {
+		return fmt.Errorf("Invalid node IP %q", nodeIP)
+	}
+
+	clusterNet, err := registry.GetClusterNetwork()
+	if err != nil {
+		return fmt.Errorf("Failed to get Cluster Network address: %v", err)
+	}
+
+	// Ensure each node's NodeIP is not contained by the cluster network,
+	// which could cause a routing loop. (rhbz#1295486)
+	ipaddr := net.ParseIP(nodeIP)
+	if ipaddr == nil {
+		return fmt.Errorf("Failed to parse node IP %s", nodeIP)
+	}
+
+	if clusterNet.Contains(ipaddr) {
+		return fmt.Errorf("Node IP %s conflicts with cluster network %s", nodeIP, clusterNet.String())
+	}
+
+	return nil
+}

@@ -24,36 +24,47 @@ import (
 	kubeutilnet "k8s.io/kubernetes/pkg/util/net"
 )
 
-type OsdnController struct {
+type OsdnMaster struct {
 	multitenant     bool
 	Registry        *Registry
-	localIP         string
-	localSubnet     *osapi.HostSubnet
-	HostName        string
 	subnetAllocator *netutils.SubnetAllocator
-	podNetworkReady chan struct{}
 	vnidMap         VNIDMap
 	netIDManager    *netutils.NetIDAllocator
 	adminNamespaces []string
 }
 
+type OsdnNode struct {
+	multitenant     bool
+	Registry        *Registry
+	localIP         string
+	localSubnet     *osapi.HostSubnet
+	HostName        string
+	podNetworkReady chan struct{}
+	vnidMap         VNIDMap
+}
+
 // Called by higher layers to create the plugin SDN master instance
-func NewMasterPlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Client) (api.OsdnPlugin, error) {
+func NewMasterPlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Client) (api.OsdnMasterPlugin, error) {
 	if !isOsdnPlugin(pluginType) {
 		return nil, nil
 	}
-	return createPlugin(osClient, kClient, pluginType, "", "")
+
+	log.Infof("Initializing SDN master of type %q", pluginType)
+	plugin := &OsdnMaster{
+		multitenant:     isMultitenantPlugin(pluginType),
+		Registry:        NewRegistry(osClient, kClient),
+		vnidMap:         NewVNIDMap(),
+		adminNamespaces: make([]string, 0),
+	}
+	return plugin, nil
 }
 
 // Called by higher layers to create the plugin SDN node instance
-func NewNodePlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Client, hostname string, selfIP string) (api.OsdnPlugin, error) {
+func NewNodePlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Client, hostname string, selfIP string) (api.OsdnNodePlugin, error) {
 	if !isOsdnPlugin(pluginType) {
 		return nil, nil
 	}
-	return createPlugin(osClient, kClient, pluginType, hostname, selfIP)
-}
 
-func createPlugin(osClient *osclient.Client, kClient *kclient.Client, pluginType string, hostname string, selfIP string) (api.OsdnPlugin, error) {
 	log.Infof("Starting with configured hostname '%s' (IP '%s')", hostname, selfIP)
 
 	if hostname == "" {
@@ -77,14 +88,13 @@ func createPlugin(osClient *osclient.Client, kClient *kclient.Client, pluginType
 		}
 	}
 
-	plugin := &OsdnController{
+	plugin := &OsdnNode{
 		multitenant:     isMultitenantPlugin(pluginType),
 		Registry:        NewRegistry(osClient, kClient),
 		localIP:         selfIP,
 		HostName:        hostname,
 		vnidMap:         NewVNIDMap(),
 		podNetworkReady: make(chan struct{}),
-		adminNamespaces: make([]string, 0),
 	}
 	if plugin.multitenant {
 		log.Infof("Initializing multi-tenant plugin for %s (%s)", hostname, selfIP)
@@ -112,7 +122,7 @@ func isMultitenantPlugin(pluginType string) bool {
 	}
 }
 
-func (oc *OsdnController) validateNetworkConfig(clusterNetwork, serviceNetwork *net.IPNet) error {
+func (oc *OsdnMaster) validateNetworkConfig(clusterNetwork, serviceNetwork *net.IPNet) error {
 	// TODO: Instead of hardcoding 'tun0' and 'lbr0', get it from common place.
 	// This will ensure both the kube/multitenant scripts and master validations use the same name.
 	hostIPNets, err := netutils.GetHostIPNetworks([]string{"tun0", "lbr0"})
@@ -168,7 +178,7 @@ func (oc *OsdnController) validateNetworkConfig(clusterNetwork, serviceNetwork *
 	return kerrors.NewAggregate(errList)
 }
 
-func (oc *OsdnController) isClusterNetworkChanged(clusterNetworkCIDR string, hostBitsPerSubnet int, serviceNetworkCIDR string) (bool, error) {
+func (oc *OsdnMaster) isClusterNetworkChanged(clusterNetworkCIDR string, hostBitsPerSubnet int, serviceNetworkCIDR string) (bool, error) {
 	clusterNetwork, hostSubnetLength, serviceNetwork, err := oc.Registry.GetNetworkInfo()
 	if err != nil {
 		return false, err
@@ -181,7 +191,7 @@ func (oc *OsdnController) isClusterNetworkChanged(clusterNetworkCIDR string, hos
 	return false, nil
 }
 
-func (oc *OsdnController) StartMaster(clusterNetworkCIDR string, clusterBitsPerSubnet uint, serviceNetworkCIDR string) error {
+func (oc *OsdnMaster) Start(clusterNetworkCIDR string, clusterBitsPerSubnet uint, serviceNetworkCIDR string) error {
 	// Validate command-line/config parameters
 	hostBitsPerSubnet := int(clusterBitsPerSubnet)
 	clusterNetwork, _, serviceNetwork, err := ValidateClusterNetwork(clusterNetworkCIDR, hostBitsPerSubnet, serviceNetworkCIDR)
@@ -216,7 +226,7 @@ func (oc *OsdnController) StartMaster(clusterNetworkCIDR string, clusterBitsPerS
 	return nil
 }
 
-func (oc *OsdnController) StartNode(mtu uint) error {
+func (oc *OsdnNode) Start(mtu uint) error {
 	// Assume we are working with IPv4
 	clusterNetwork, err := oc.Registry.GetClusterNetwork()
 	if err != nil {
@@ -266,15 +276,15 @@ func (oc *OsdnController) StartNode(mtu uint) error {
 	return nil
 }
 
-func (oc *OsdnController) GetLocalPods(namespace string) ([]kapi.Pod, error) {
+func (oc *OsdnNode) GetLocalPods(namespace string) ([]kapi.Pod, error) {
 	return oc.Registry.GetRunningPods(oc.HostName, namespace)
 }
 
-func (oc *OsdnController) markPodNetworkReady() {
+func (oc *OsdnNode) markPodNetworkReady() {
 	close(oc.podNetworkReady)
 }
 
-func (oc *OsdnController) WaitForPodNetworkReady() error {
+func (oc *OsdnNode) WaitForPodNetworkReady() error {
 	logInterval := 10 * time.Second
 	numIntervals := 12 // timeout: 2 mins
 
