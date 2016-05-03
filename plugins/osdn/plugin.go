@@ -11,8 +11,11 @@ import (
 
 	"github.com/openshift/openshift-sdn/plugins/osdn/api"
 
+	osclient "github.com/openshift/origin/pkg/client"
+
 	kapi "k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/resource"
+	kclient "k8s.io/kubernetes/pkg/client/unversioned"
 	kubeletTypes "k8s.io/kubernetes/pkg/kubelet/container"
 	knetwork "k8s.io/kubernetes/pkg/kubelet/network"
 	utilsets "k8s.io/kubernetes/pkg/util/sets"
@@ -30,15 +33,50 @@ type ovsPlugin struct {
 	multitenant bool
 }
 
-func CreatePlugin(registry *Registry, multitenant bool, hostname string, selfIP string) (api.OsdnPlugin, error) {
-	plugin := &ovsPlugin{multitenant: multitenant}
+// Called by higher layers to create the plugin SDN master instance
+func NewMasterPlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Client) (api.OsdnPlugin, error) {
+	if !isOsdnPlugin(pluginType) {
+		return nil, nil
+	}
+	return createPlugin(osClient, kClient, pluginType, "", "")
+}
 
-	err := plugin.BaseInit(registry, plugin, multitenant, hostname, selfIP)
+// Called by higher layers to create the plugin SDN node instance
+func NewNodePlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Client, hostname string, selfIP string) (api.OsdnPlugin, error) {
+	if !isOsdnPlugin(pluginType) {
+		return nil, nil
+	}
+	return createPlugin(osClient, kClient, pluginType, hostname, selfIP)
+}
+
+func createPlugin(osClient *osclient.Client, kClient *kclient.Client, pluginType string, hostname string, selfIP string) (api.OsdnPlugin, error) {
+	registry := NewRegistry(osClient, kClient)
+	plugin := &ovsPlugin{multitenant: isMultitenantPlugin(pluginType)}
+
+	err := plugin.BaseInit(registry, plugin, plugin.multitenant, hostname, selfIP)
 	if err != nil {
 		return nil, err
 	}
 
 	return plugin, err
+}
+
+func isOsdnPlugin(pluginType string) bool {
+	switch strings.ToLower(pluginType) {
+	case api.SingleTenantPluginName, api.MultiTenantPluginName:
+		return true
+	default:
+		return false
+	}
+}
+
+func isMultitenantPlugin(pluginType string) bool {
+	switch strings.ToLower(pluginType) {
+	case api.MultiTenantPluginName:
+		return true
+	default:
+		return false
+	}
 }
 
 func (plugin *ovsPlugin) PluginStartMaster(clusterNetwork *net.IPNet, hostSubnetLength uint) error {

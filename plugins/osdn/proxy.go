@@ -9,7 +9,10 @@ import (
 
 	"github.com/openshift/openshift-sdn/plugins/osdn/api"
 
+	osclient "github.com/openshift/origin/pkg/client"
+
 	kapi "k8s.io/kubernetes/pkg/api"
+	kclient "k8s.io/kubernetes/pkg/client/unversioned"
 	pconfig "k8s.io/kubernetes/pkg/proxy/config"
 	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
 	utilwait "k8s.io/kubernetes/pkg/util/wait"
@@ -24,11 +27,16 @@ type ovsProxyPlugin struct {
 	baseEndpointsHandler pconfig.EndpointsConfigHandler
 }
 
-func CreateProxyPlugin(registry *Registry) (api.FilteringEndpointsConfigHandler, error) {
-	return &ovsProxyPlugin{
-		registry: registry,
-		podsByIP: make(map[string]*kapi.Pod),
-	}, nil
+// Called by higher layers to create the proxy plugin instance; only used by nodes
+func NewProxyPlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Client) (api.FilteringEndpointsConfigHandler, error) {
+	if isMultitenantPlugin(pluginType) {
+		return &ovsProxyPlugin{
+			registry: NewRegistry(osClient, kClient),
+			podsByIP: make(map[string]*kapi.Pod),
+		}, nil
+	}
+
+	return nil, nil
 }
 
 func (proxy *ovsProxyPlugin) Start(baseHandler pconfig.EndpointsConfigHandler) error {
