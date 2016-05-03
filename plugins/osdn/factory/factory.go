@@ -8,8 +8,6 @@ import (
 
 	osclient "github.com/openshift/origin/pkg/client"
 	kclient "k8s.io/kubernetes/pkg/client/unversioned"
-
-	"github.com/openshift/openshift-sdn/plugins/osdn/ovs"
 )
 
 // Call by higher layers to create the plugin SDN master instance
@@ -25,9 +23,9 @@ func NewNodePlugin(pluginType string, osClient *osclient.Client, kClient *kclien
 func newPlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Client, hostname string, selfIP string) (api.OsdnPlugin, error) {
 	switch strings.ToLower(pluginType) {
 	case api.SingleTenantPluginName:
-		return ovs.CreatePlugin(osdn.NewRegistry(osClient, kClient), false, hostname, selfIP)
+		return osdn.CreatePlugin(osdn.NewRegistry(osClient, kClient), false, hostname, selfIP)
 	case api.MultiTenantPluginName:
-		return ovs.CreatePlugin(osdn.NewRegistry(osClient, kClient), true, hostname, selfIP)
+		return osdn.CreatePlugin(osdn.NewRegistry(osClient, kClient), true, hostname, selfIP)
 	}
 
 	return nil, nil
@@ -37,7 +35,7 @@ func newPlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Cl
 func NewProxyPlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Client) (api.FilteringEndpointsConfigHandler, error) {
 	switch strings.ToLower(pluginType) {
 	case api.MultiTenantPluginName:
-		return ovs.CreateProxyPlugin(osdn.NewRegistry(osClient, kClient))
+		return osdn.CreateProxyPlugin(osdn.NewRegistry(osClient, kClient))
 	}
 
 	return nil, nil
