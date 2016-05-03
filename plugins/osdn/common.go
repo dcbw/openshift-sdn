@@ -10,10 +10,14 @@ import (
 	log "github.com/golang/glog"
 
 	"github.com/openshift/openshift-sdn/pkg/netutils"
+	"github.com/openshift/openshift-sdn/plugins/osdn/api"
+
+	osclient "github.com/openshift/origin/pkg/client"
 	osapi "github.com/openshift/origin/pkg/sdn/api"
 
 	kapi "k8s.io/kubernetes/pkg/api"
-	kubetypes "k8s.io/kubernetes/pkg/kubelet/container"
+	kclient "k8s.io/kubernetes/pkg/client/unversioned"
+	kubeletTypes "k8s.io/kubernetes/pkg/kubelet/container"
 	utildbus "k8s.io/kubernetes/pkg/util/dbus"
 	kerrors "k8s.io/kubernetes/pkg/util/errors"
 	kexec "k8s.io/kubernetes/pkg/util/exec"
@@ -21,23 +25,8 @@ import (
 	kubeutilnet "k8s.io/kubernetes/pkg/util/net"
 )
 
-type PluginHooks interface {
-	PluginStartMaster(clusterNetwork *net.IPNet, hostSubnetLength uint) error
-	PluginStartNode(mtu uint) error
-
-	SetupSDN(localSubnetCIDR, clusterNetworkCIDR, serviceNetworkCIDR string, mtu uint) (bool, error)
-
-	AddHostSubnetRules(subnet *osapi.HostSubnet) error
-	DeleteHostSubnetRules(subnet *osapi.HostSubnet) error
-
-	AddServiceRules(service *kapi.Service, netID uint) error
-	DeleteServiceRules(service *kapi.Service) error
-
-	UpdatePod(namespace string, name string, id kubetypes.DockerID) error
-}
-
 type OsdnController struct {
-	pluginHooks     PluginHooks
+	multitenant     bool
 	Registry        *Registry
 	localIP         string
 	localSubnet     *osapi.HostSubnet
@@ -50,15 +39,29 @@ type OsdnController struct {
 	adminNamespaces []string
 }
 
-// Called by plug factory functions to initialize the generic plugin instance
-func (oc *OsdnController) BaseInit(registry *Registry, pluginHooks PluginHooks, multitenant bool, hostname string, selfIP string) error {
+// Called by higher layers to create the plugin SDN master instance
+func NewMasterPlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Client) (api.OsdnPlugin, error) {
+	if !isOsdnPlugin(pluginType) {
+		return nil, nil
+	}
+	return createPlugin(osClient, kClient, pluginType, "", "")
+}
 
+// Called by higher layers to create the plugin SDN node instance
+func NewNodePlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Client, hostname string, selfIP string) (api.OsdnPlugin, error) {
+	if !isOsdnPlugin(pluginType) {
+		return nil, nil
+	}
+	return createPlugin(osClient, kClient, pluginType, hostname, selfIP)
+}
+
+func createPlugin(osClient *osclient.Client, kClient *kclient.Client, pluginType string, hostname string, selfIP string) (api.OsdnPlugin, error) {
 	log.Infof("Starting with configured hostname '%s' (IP '%s')", hostname, selfIP)
 
 	if hostname == "" {
 		output, err := kexec.New().Command("uname", "-n").CombinedOutput()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		hostname = strings.TrimSpace(string(output))
 	}
@@ -70,26 +73,45 @@ func (oc *OsdnController) BaseInit(registry *Registry, pluginHooks PluginHooks, 
 			log.V(5).Infof("Failed to determine node address from hostname %s; using default interface (%v)", hostname, err)
 			defaultIP, err := kubeutilnet.ChooseHostInterface()
 			if err != nil {
-				return err
+				return nil, err
 			}
 			selfIP = defaultIP.String()
 		}
 	}
-	if multitenant {
+
+	plugin := &OsdnController{
+		multitenant:     isMultitenantPlugin(pluginType),
+		Registry:        NewRegistry(osClient, kClient),
+		localIP:         selfIP,
+		HostName:        hostname,
+		vnidMap:         make(map[string]uint),
+		podNetworkReady: make(chan struct{}),
+		adminNamespaces: make([]string, 0),
+	}
+	if plugin.multitenant {
 		log.Infof("Initializing multi-tenant plugin for %s (%s)", hostname, selfIP)
 	} else {
 		log.Infof("Initializing single-tenant plugin for %s (%s)", hostname, selfIP)
 	}
+	return plugin, nil
+}
 
-	oc.pluginHooks = pluginHooks
-	oc.Registry = registry
-	oc.localIP = selfIP
-	oc.HostName = hostname
-	oc.vnidMap = make(map[string]uint)
-	oc.podNetworkReady = make(chan struct{})
-	oc.adminNamespaces = make([]string, 0)
+func isOsdnPlugin(pluginType string) bool {
+	switch strings.ToLower(pluginType) {
+	case api.SingleTenantPluginName, api.MultiTenantPluginName:
+		return true
+	default:
+		return false
+	}
+}
 
-	return nil
+func isMultitenantPlugin(pluginType string) bool {
+	switch strings.ToLower(pluginType) {
+	case api.MultiTenantPluginName:
+		return true
+	default:
+		return false
+	}
 }
 
 func (oc *OsdnController) validateNetworkConfig(clusterNetwork, serviceNetwork *net.IPNet) error {
@@ -183,9 +205,16 @@ func (oc *OsdnController) StartMaster(clusterNetworkCIDR string, clusterBitsPerS
 		}
 	}
 
-	if err := oc.pluginHooks.PluginStartMaster(clusterNetwork, clusterBitsPerSubnet); err != nil {
-		return fmt.Errorf("Failed to start plugin: %v", err)
+	if err := oc.SubnetStartMaster(clusterNetwork, clusterBitsPerSubnet); err != nil {
+		return err
 	}
+
+	if oc.multitenant {
+		if err := oc.VnidStartMaster(); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -209,8 +238,29 @@ func (oc *OsdnController) StartNode(mtu uint) error {
 		}
 	})
 
-	if err := oc.pluginHooks.PluginStartNode(mtu); err != nil {
-		return fmt.Errorf("Failed to start plugin: %v", err)
+	networkChanged, err := oc.SubnetStartNode(mtu)
+	if err != nil {
+		return err
+	}
+
+	if oc.multitenant {
+		if err := oc.VnidStartNode(); err != nil {
+			return err
+		}
+	}
+
+	if networkChanged {
+		pods, err := oc.GetLocalPods(kapi.NamespaceAll)
+		if err != nil {
+			return err
+		}
+		for _, p := range pods {
+			containerID := GetPodContainerID(&p)
+			err = oc.UpdatePod(p.Namespace, p.Name, kubeletTypes.DockerID(containerID))
+			if err != nil {
+				log.Warningf("Could not update pod %q (%s): %s", p.Name, containerID, err)
+			}
+		}
 	}
 
 	oc.markPodNetworkReady()
