@@ -155,50 +155,50 @@ func (master *OsdnMaster) watchNamespaces() {
 	}
 }
 
-func (oc *OsdnNode) VnidStartNode() error {
+func (node *OsdnNode) VnidStartNode() error {
 	// Populate vnid map synchronously so that existing services can fetch vnid
-	err := oc.vnidMap.PopulateVNIDs(oc.Registry)
+	err := node.vnidMap.PopulateVNIDs(node.registry)
 	if err != nil {
 		return err
 	}
 
-	go utilwait.Forever(oc.watchNetNamespaces, 0)
-	go utilwait.Forever(oc.watchServices, 0)
+	go utilwait.Forever(node.watchNetNamespaces, 0)
+	go utilwait.Forever(node.watchServices, 0)
 	return nil
 }
 
-func (oc *OsdnNode) updatePodNetwork(namespace string, netID uint) error {
+func (node *OsdnNode) updatePodNetwork(namespace string, netID uint) error {
 	// Update OF rules for the existing/old pods in the namespace
-	pods, err := oc.GetLocalPods(namespace)
+	pods, err := node.GetLocalPods(namespace)
 	if err != nil {
 		return err
 	}
 	for _, pod := range pods {
-		err := oc.UpdatePod(pod.Namespace, pod.Name, kubetypes.DockerID(GetPodContainerID(&pod)))
+		err := node.UpdatePod(pod.Namespace, pod.Name, kubetypes.DockerID(GetPodContainerID(&pod)))
 		if err != nil {
 			return err
 		}
 	}
 
 	// Update OF rules for the old services in the namespace
-	services, err := oc.Registry.GetServicesForNamespace(namespace)
+	services, err := node.registry.GetServicesForNamespace(namespace)
 	if err != nil {
 		return err
 	}
 	errList := []error{}
 	for _, svc := range services {
-		if err := oc.DeleteServiceRules(&svc); err != nil {
+		if err := node.DeleteServiceRules(&svc); err != nil {
 			log.Error(err)
 		}
-		if err := oc.AddServiceRules(&svc, netID); err != nil {
+		if err := node.AddServiceRules(&svc, netID); err != nil {
 			errList = append(errList, err)
 		}
 	}
 	return kerrors.NewAggregate(errList)
 }
 
-func (oc *OsdnNode) watchNetNamespaces() {
-	eventQueue := oc.Registry.RunEventQueue(NetNamespaces)
+func (node *OsdnNode) watchNetNamespaces() {
+	eventQueue := node.registry.RunEventQueue(NetNamespaces)
 
 	for {
 		eventType, obj, err := eventQueue.Pop()
@@ -211,25 +211,25 @@ func (oc *OsdnNode) watchNetNamespaces() {
 		switch eventType {
 		case watch.Added, watch.Modified:
 			// Skip this event if the old and new network ids are same
-			oldNetID, err := oc.vnidMap.GetVNID(netns.NetName)
+			oldNetID, err := node.vnidMap.GetVNID(netns.NetName)
 			if (err == nil) && (oldNetID == netns.NetID) {
 				continue
 			}
-			oc.vnidMap.SetVNID(netns.NetName, netns.NetID)
+			node.vnidMap.SetVNID(netns.NetName, netns.NetID)
 
-			err = oc.updatePodNetwork(netns.NetName, netns.NetID)
+			err = node.updatePodNetwork(netns.NetName, netns.NetID)
 			if err != nil {
 				log.Errorf("Failed to update pod network for namespace '%s', error: %s", netns.NetName, err)
-				oc.vnidMap.SetVNID(netns.NetName, oldNetID)
+				node.vnidMap.SetVNID(netns.NetName, oldNetID)
 				continue
 			}
 		case watch.Deleted:
 			// updatePodNetwork needs vnid, so unset vnid after this call
-			err := oc.updatePodNetwork(netns.NetName, AdminVNID)
+			err := node.updatePodNetwork(netns.NetName, AdminVNID)
 			if err != nil {
 				log.Errorf("Failed to update pod network for namespace '%s', error: %s", netns.NetName, err)
 			}
-			oc.vnidMap.UnsetVNID(netns.NetName)
+			node.vnidMap.UnsetVNID(netns.NetName)
 		}
 	}
 }
@@ -247,9 +247,9 @@ func isServiceChanged(oldsvc, newsvc *kapi.Service) bool {
 	return true
 }
 
-func (oc *OsdnNode) watchServices() {
+func (node *OsdnNode) watchServices() {
 	services := make(map[string]*kapi.Service)
-	eventQueue := oc.Registry.RunEventQueue(Services)
+	eventQueue := node.registry.RunEventQueue(Services)
 
 	for {
 		eventType, obj, err := eventQueue.Pop()
@@ -271,18 +271,18 @@ func (oc *OsdnNode) watchServices() {
 				if !isServiceChanged(oldsvc, serv) {
 					continue
 				}
-				if err := oc.DeleteServiceRules(oldsvc); err != nil {
+				if err := node.DeleteServiceRules(oldsvc); err != nil {
 					log.Error(err)
 				}
 			}
 
-			netid, err := oc.vnidMap.WaitAndGetVNID(serv.Namespace)
+			netid, err := node.vnidMap.WaitAndGetVNID(serv.Namespace)
 			if err != nil {
 				log.Errorf("Skipped adding service rules for serviceEvent: %v, Error: %v", eventType, err)
 				continue
 			}
 
-			if err := oc.AddServiceRules(serv, netid); err != nil {
+			if err := node.AddServiceRules(serv, netid); err != nil {
 				log.Error(err)
 				continue
 			}
@@ -290,7 +290,7 @@ func (oc *OsdnNode) watchServices() {
 		case watch.Deleted:
 			delete(services, string(serv.UID))
 
-			if err := oc.DeleteServiceRules(serv); err != nil {
+			if err := node.DeleteServiceRules(serv); err != nil {
 				log.Error(err)
 			}
 		}
