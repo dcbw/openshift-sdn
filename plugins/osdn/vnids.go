@@ -23,28 +23,28 @@ const (
 	AdminVNID = uint(0)
 )
 
-func (oc *OsdnMaster) VnidStartMaster() error {
-	err := oc.vnidMap.PopulateVNIDs(oc.Registry)
+func (master *OsdnMaster) VnidStartMaster() error {
+	err := master.vnidMap.PopulateVNIDs(master.registry)
 	if err != nil {
 		return err
 	}
 
 	// VNID: 0 reserved for default namespace and can reach any network in the cluster
 	// VNID: 1 to 9 are internally reserved for any special cases in the future
-	oc.netIDManager, err = netutils.NewNetIDAllocator(10, MaxVNID, oc.vnidMap.GetAllocatedVNIDs())
+	master.netIDManager, err = netutils.NewNetIDAllocator(10, MaxVNID, master.vnidMap.GetAllocatedVNIDs())
 	if err != nil {
 		return err
 	}
 
 	// 'default' namespace is currently always an admin namespace
-	oc.adminNamespaces = append(oc.adminNamespaces, "default")
+	master.adminNamespaces = append(master.adminNamespaces, "default")
 
-	go utilwait.Forever(oc.watchNamespaces, 0)
+	go utilwait.Forever(master.watchNamespaces, 0)
 	return nil
 }
 
-func (oc *OsdnMaster) isAdminNamespace(nsName string) bool {
-	for _, name := range oc.adminNamespaces {
+func (master *OsdnMaster) isAdminNamespace(nsName string) bool {
+	for _, name := range master.adminNamespaces {
 		if name == nsName {
 			return true
 		}
@@ -52,55 +52,55 @@ func (oc *OsdnMaster) isAdminNamespace(nsName string) bool {
 	return false
 }
 
-func (oc *OsdnMaster) assignVNID(namespaceName string) error {
+func (master *OsdnMaster) assignVNID(namespaceName string) error {
 	// Nothing to do if the netid is in the vnid map
-	if _, err := oc.vnidMap.GetVNID(namespaceName); err == nil {
+	if _, err := master.vnidMap.GetVNID(namespaceName); err == nil {
 		return nil
 	}
 
 	// If NetNamespace is present, update vnid map
-	netns, err := oc.Registry.GetNetNamespace(namespaceName)
+	netns, err := master.registry.GetNetNamespace(namespaceName)
 	if err == nil {
-		oc.vnidMap.SetVNID(namespaceName, netns.NetID)
+		master.vnidMap.SetVNID(namespaceName, netns.NetID)
 		return nil
 	}
 
 	// NetNamespace not found, so allocate new NetID
 	var netid uint
-	if oc.isAdminNamespace(namespaceName) {
+	if master.isAdminNamespace(namespaceName) {
 		netid = AdminVNID
 	} else {
 		var err error
-		netid, err = oc.netIDManager.GetNetID()
+		netid, err = master.netIDManager.GetNetID()
 		if err != nil {
 			return err
 		}
 	}
 
 	// Create NetNamespace Object and update vnid map
-	err = oc.Registry.WriteNetNamespace(namespaceName, netid)
+	err = master.registry.WriteNetNamespace(namespaceName, netid)
 	if err != nil {
-		e := oc.netIDManager.ReleaseNetID(netid)
+		e := master.netIDManager.ReleaseNetID(netid)
 		if e != nil {
 			log.Errorf("Error while releasing netid: %v", e)
 		}
 		return err
 	}
-	oc.vnidMap.SetVNID(namespaceName, netid)
+	master.vnidMap.SetVNID(namespaceName, netid)
 	return nil
 }
 
-func (oc *OsdnMaster) revokeVNID(namespaceName string) error {
+func (master *OsdnMaster) revokeVNID(namespaceName string) error {
 	// Remove NetID from vnid map
 	netid_found := true
-	netid, err := oc.vnidMap.UnsetVNID(namespaceName)
+	netid, err := master.vnidMap.UnsetVNID(namespaceName)
 	if err != nil {
 		log.Error(err)
 		netid_found = false
 	}
 
 	// Delete NetNamespace object
-	err = oc.Registry.DeleteNetNamespace(namespaceName)
+	err = master.registry.DeleteNetNamespace(namespaceName)
 	if err != nil {
 		return err
 	}
@@ -114,8 +114,8 @@ func (oc *OsdnMaster) revokeVNID(namespaceName string) error {
 
 	// Check if this netid is used by any other namespaces
 	// If not, then release the netid
-	if !oc.vnidMap.CheckVNID(netid) {
-		err = oc.netIDManager.ReleaseNetID(netid)
+	if !master.vnidMap.CheckVNID(netid) {
+		err = master.netIDManager.ReleaseNetID(netid)
 		if err != nil {
 			return fmt.Errorf("Error while releasing netid %d for namespace %q, %v", netid, namespaceName, err)
 		}
@@ -126,8 +126,8 @@ func (oc *OsdnMaster) revokeVNID(namespaceName string) error {
 	return nil
 }
 
-func (oc *OsdnMaster) watchNamespaces() {
-	eventQueue := oc.Registry.RunEventQueue(Namespaces)
+func (master *OsdnMaster) watchNamespaces() {
+	eventQueue := master.registry.RunEventQueue(Namespaces)
 
 	for {
 		eventType, obj, err := eventQueue.Pop()
@@ -140,13 +140,13 @@ func (oc *OsdnMaster) watchNamespaces() {
 
 		switch eventType {
 		case watch.Added, watch.Modified:
-			err := oc.assignVNID(name)
+			err := master.assignVNID(name)
 			if err != nil {
 				log.Errorf("Error assigning netid: %v", err)
 				continue
 			}
 		case watch.Deleted:
-			err := oc.revokeVNID(name)
+			err := master.revokeVNID(name)
 			if err != nil {
 				log.Errorf("Error revoking netid: %v", err)
 				continue
