@@ -1,0 +1,462 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/openshift/openshift-sdn/plugins/osdn/api"
+
+	"github.com/containernetworking/cni/pkg/skel"
+	"github.com/containernetworking/cni/pkg/ns"
+	"github.com/containernetworking/cni/pkg/ip"
+	"github.com/containernetworking/cni/pkg/ipam"
+
+	"github.com/vishvananda/netlink"
+
+	"k8s.io/kubernetes/pkg/api/resource"
+)
+
+const (
+	sdnScript   = "openshift-sdn-ovs"
+	setUpCmd    = "setup"
+	tearDownCmd = "teardown"
+	statusCmd   = "status"
+	updateCmd   = "update"
+
+	AssignMacVlanAnnotation string = "pod.network.openshift.io/assign-macvlan"
+
+	interfaceName      = "eth0"
+	ipamConfigTemplate = `{
+  "cniVersion": "0.1.0",
+  "name": "openshift-sdn",
+  "type": "openshift-sdn",
+  "ipam": {
+    "type": "host-local",
+    "subnet": "%s",
+    "routes": [
+      { "dst": "0.0.0.0/0", "gw": "%s" },
+      { "dst": "%s" }
+    ]
+  }
+}`
+)
+
+func getNetworkInfo(client *http.Client) (*api.GetNetworkResponse, error) {
+	// Try few times up to 15 seconds
+	retries := 150
+	retryInterval := 100 * time.Millisecond
+	for i := 0; i < retries; i++ {
+		network := &api.GetNetworkResponse{}
+		// HTTP client requires a URL including a domain part, but
+		// since we're talking to a unix socket the domain doesn't matter
+		if err := getUrl(client, "http://d/network", network); err == nil {
+			return network, nil
+		}
+		time.Sleep(retryInterval)
+	}
+
+	return nil, fmt.Errorf("Timed out waiting for openshift to be ready")
+}
+
+func socketDial(proto, addr string) (conn net.Conn, err error) {
+    return net.Dial("unix", api.PodInfoSocketPath)
+}
+
+func getUrl(client *http.Client, url string, object interface{}) error {
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("Failed to retrieve %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("Failed to read %s: %v", url, err)
+	}
+
+	if err := json.Unmarshal(body, object); err != nil {
+		return fmt.Errorf("Failed to read %s: %v", url, err)
+	}
+
+	return nil
+}
+
+func readPodInfo(client *http.Client, cniArgs string) (*api.GetPodResponse, error) {
+	var namespace, name string
+	for _, arg := range strings.Split(cniArgs, ";") {
+		parts := strings.Split(arg, "=")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("Invalid CNI_ARG '%s'", arg)
+		}
+		switch parts[0] {
+		case "K8S_POD_NAMESPACE":
+			namespace = strings.TrimSpace(parts[1])
+		case "K8S_POD_NAME":
+			name = strings.TrimSpace(parts[1])
+		}
+	}
+
+	if namespace == "" || name == "" {
+		return nil, fmt.Errorf("Missing pod namespace or name")
+	}
+
+	info := &api.GetPodResponse{}
+	url := fmt.Sprintf("http://d/pods/%s/%s", namespace, name)
+	if err := getUrl(client, url, info); err != nil {
+		return nil, err
+	}
+
+	return info, nil
+}
+
+// TODO: replace with k8s.io/kubernetes/pkg/util/bandwidth when rebasing to Kube 1.3
+var minRsrc = resource.MustParse("1k")
+var maxRsrc = resource.MustParse("1P")
+
+func validateBandwidthIsReasonable(rsrc *resource.Quantity) error {
+	if rsrc.Value() < minRsrc.Value() {
+		return fmt.Errorf("resource is unreasonably small (< 1kbit)")
+	}
+	if rsrc.Value() > maxRsrc.Value() {
+		return fmt.Errorf("resoruce is unreasonably large (> 1Pbit)")
+	}
+	return nil
+}
+
+func extractPodBandwidthResources(podAnnotations map[string]string) (ingress, egress *resource.Quantity, err error) {
+	str, found := podAnnotations["kubernetes.io/ingress-bandwidth"]
+	if found {
+		if ingress, err = resource.ParseQuantity(str); err != nil {
+			return nil, nil, err
+		}
+		if err := validateBandwidthIsReasonable(ingress); err != nil {
+			return nil, nil, err
+		}
+	}
+	str, found = podAnnotations["kubernetes.io/egress-bandwidth"]
+	if found {
+		if egress, err = resource.ParseQuantity(str); err != nil {
+			return nil, nil, err
+		}
+		if err := validateBandwidthIsReasonable(egress); err != nil {
+			return nil, nil, err
+		}
+	}
+	return ingress, egress, nil
+}
+
+func getBandwidth(podInfo *api.GetPodResponse) (string, string, error) {
+	ingress, egress, err := extractPodBandwidthResources(podInfo.Annotations)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to parse pod bandwidth: %v", err)
+	}
+	var ingressStr, egressStr string
+	if ingress != nil {
+		ingressStr = fmt.Sprintf("%d", ingress)
+	}
+	if egress != nil {
+		egressStr = fmt.Sprintf("%d", egress)
+	}
+	return ingressStr, egressStr, nil
+}
+
+func wantsMacvlan(podInfo *api.GetPodResponse) (bool, error) {
+	val, found := podInfo.Annotations[AssignMacVlanAnnotation]
+	if !found || val != "true" {
+		return false, nil
+	}
+	if podInfo.Privileged {
+		return true, nil
+	}
+	return false, fmt.Errorf("Pod has %q annotation but is not privileged", AssignMacVlanAnnotation)
+}
+
+func getPodInfo(cniArgs string) (*api.GetNetworkResponse, string, string, string, bool, error) {
+	// Wait for openshift to be ready
+	client := &http.Client{
+		Transport: &http.Transport{
+			Dial: socketDial,
+		},
+	}
+	netInfo, err := getNetworkInfo(client)
+	if err != nil {
+		return nil, "", "", "", false, err
+	}
+
+	podInfo, err := readPodInfo(client, cniArgs)
+	if err != nil {
+		return nil, "", "", "", false, err
+	}
+
+	vnid := strconv.FormatUint(uint64(podInfo.Vnid), 10)
+
+	ingress, egress, err := getBandwidth(podInfo)
+	if err != nil {
+		return nil, "", "", "", false, err
+	}
+
+	macvlan, err := wantsMacvlan(podInfo)
+	if err != nil {
+		return nil, "", "", "", false, err
+	}
+
+	return netInfo, vnid, ingress, egress, macvlan, nil
+}
+
+// Returns host veth name, container veth MAC, and pod IP
+func getVethInfo(netns, containerIfname string) (netlink.Link, string, string, error) {
+	var (
+		peerIfindex int
+		contVeth    netlink.Link
+		err         error
+		podIP       string
+	)
+
+	containerNs, err := ns.GetNS(netns)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("Failed to get container netns: %v", err)
+	}
+	defer containerNs.Close()
+
+	err = containerNs.Do(func(ns.NetNS) error {
+		contVeth, err = netlink.LinkByName(containerIfname)
+		if err != nil {
+			return err
+		}
+		peerIfindex = contVeth.Attrs().ParentIndex
+
+		addrs, err := netlink.AddrList(contVeth, syscall.AF_INET)
+		if err != nil {
+			return fmt.Errorf("failed to get container IP addresses: %v", err)
+		}
+		if len(addrs) == 0 {
+			return fmt.Errorf("container had no addresses")
+		}
+		podIP = addrs[0].IP.String()
+
+		return nil
+	})
+	if err != nil {
+		return nil, "", "", fmt.Errorf("Failed to inspect container interface: %v", err)
+	}
+
+	hostVeth, err := netlink.LinkByIndex(peerIfindex)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("Failed to get host veth: %v", err)
+	}
+
+	return hostVeth, contVeth.Attrs().HardwareAddr.String(), podIP, nil
+}
+
+func addMacvlan(netns string) error {
+	var defIface netlink.Link
+	var err      error
+
+	// Find interface with the default route
+	routes, _ := netlink.RouteList(nil, netlink.FAMILY_V4)
+	for _, r := range routes {
+		if r.Dst == nil {
+			defIface, err = netlink.LinkByIndex(r.LinkIndex)
+			if err != nil {
+				return fmt.Errorf("Failed to get default route interface: %v", err)
+			}
+		}
+	}
+	if defIface == nil {
+		return fmt.Errorf("Failed to find default route interface")
+	}
+
+	containerNs, err := ns.GetNS(netns)
+	if err != nil {
+		return fmt.Errorf("Failed to get container netns: %v", err)
+	}
+	defer containerNs.Close()
+
+	return containerNs.Do(func (ns.NetNS) error {
+		err := netlink.LinkAdd(&netlink.Macvlan{
+			LinkAttrs: netlink.LinkAttrs{
+				MTU:         defIface.Attrs().MTU,
+				Name:        "macvlan0",
+				ParentIndex: defIface.Attrs().Index,
+			},
+			Mode: netlink.MACVLAN_MODE_PRIVATE,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create macvlan interface: %v", err)
+		}
+		l, err := netlink.LinkByName("macvlan0")
+		if err != nil {
+			return fmt.Errorf("failed to create find macvlan interface: %v", err)
+		}
+		err = netlink.LinkSetUp(l)
+		if err != nil {
+			return fmt.Errorf("failed to set macvlan interface up: %v", err)
+		}
+		return nil
+	})
+}
+
+func getIPAMConfig(netInfo *api.GetNetworkResponse) []byte {
+	return []byte(fmt.Sprintf(ipamConfigTemplate, netInfo.NodeNetwork, netInfo.NodeGateway, netInfo.ClusterNetwork))
+}
+
+func isScriptError(err error) bool {
+	_, ok := err.(*exec.ExitError)
+	return ok
+}
+
+// Get the last command (which is prefixed with "+" because of "set -x") and its output
+func getScriptError(output []byte) string {
+	lines := strings.Split(string(output), "\n")
+	for n := len(lines) - 1; n >= 0; n-- {
+		if strings.HasPrefix(lines[n], "+") {
+			return strings.Join(lines[n:], "\n")
+		}
+	}
+	return string(output)
+}
+
+func cmdAdd(args *skel.CmdArgs) error {
+	netInfo, vnid, ingress, egress, macvlan, err := getPodInfo(args.Args)
+	if err != nil {
+		return err
+	}
+
+	// Run IPAM so we can set up container veth
+	ipamConfig := getIPAMConfig(netInfo)
+	os.Setenv("CNI_ARGS", "")
+	result, err := ipam.ExecAdd("host-local", ipamConfig)
+	if err != nil {
+		return fmt.Errorf("Failed to run CNI IPAM ADD: %v", err)
+	}
+	if result.IP4 == nil || result.IP4.IP.IP.To4() == nil {
+		return fmt.Errorf("Failed to obtain IP address from CNI IPAM")
+	}
+
+	var hostVeth, contVeth netlink.Link
+	err = ns.WithNetNSPath(args.Netns, func(hostNS ns.NetNS) error {
+		hostVeth, contVeth, err = ip.SetupVeth(interfaceName, int(netInfo.MTU), hostNS)
+		if err != nil {
+			return fmt.Errorf("Failed to create container veth: %v", err)
+		}
+		// refetch to get hardware address and other properties
+		contVeth, err = netlink.LinkByIndex(contVeth.Attrs().Index)
+		if err != nil {
+			return fmt.Errorf("Failed to fetch container veth: %v", err)
+		}
+
+		// Clear out gateway to prevent ConfigureIface from adding the cluster
+		// subnet via the gateway
+		result.IP4.Gateway = nil
+		if err = ipam.ConfigureIface(interfaceName, result); err != nil {
+			return fmt.Errorf("Failed to configure container IPAM: %v", err)
+		}
+
+		lo, err := netlink.LinkByName("lo")
+		if err == nil {
+			err = netlink.LinkSetUp(lo)
+		}
+		if err != nil {
+			return fmt.Errorf("Failed to configure container loopback: %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		ipam.ExecDel("host-local", ipamConfig)
+		return err
+	}
+
+	if macvlan {
+		if err := addMacvlan(args.Netns); err != nil {
+			ipam.ExecDel("host-local", ipamConfig)
+			return err
+		}
+	}
+
+	contVethMac := contVeth.Attrs().HardwareAddr.String()
+	podIP := result.IP4.IP.String()
+	out, err := exec.Command(sdnScript, setUpCmd, hostVeth.Attrs().Name, contVethMac, podIP, vnid, ingress, egress).CombinedOutput()
+	if isScriptError(err) {
+		ipam.ExecDel("host-local", ipamConfig)
+		return fmt.Errorf("Error running network setup script: %s", getScriptError(out))
+	} else if err != nil {
+		ipam.ExecDel("host-local", ipamConfig)
+		return err
+	}
+
+	return result.Print()
+}
+
+func cmdUpdate(args *skel.CmdArgs) error {
+	_, vnid, ingress, egress, _, err := getPodInfo(args.Args)
+	if err != nil {
+		return err
+	}
+
+	hostVeth, contVethMac, podIP, err := getVethInfo(args.Netns, args.IfName)
+	if err != nil {
+		return err
+	}
+
+	out, err := exec.Command(sdnScript, updateCmd, hostVeth.Attrs().Name, contVethMac, podIP, vnid, ingress, egress).CombinedOutput()
+
+	if isScriptError(err) {
+		return fmt.Errorf("Error running network update script: %s", getScriptError(out))
+	} else if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+
+func cmdDel(args *skel.CmdArgs) error {
+	netInfo, _, _, _, _, err := getPodInfo(args.Args)
+	if err != nil {
+		return err
+	}
+
+	hostVeth, contVethMac, podIP, err := getVethInfo(args.Netns, args.IfName)
+	if err != nil {
+		return err
+	}
+
+	// The script's teardown functionality doesn't need the VNID
+	out, err := exec.Command(sdnScript, tearDownCmd, hostVeth.Attrs().Name, contVethMac, podIP, "-1").CombinedOutput()
+
+	if isScriptError(err) {
+		return fmt.Errorf("Error running network teardown script: %s", getScriptError(out))
+	} else if err != nil {
+		return err
+	}
+
+	// Run IPAM to release the IP address lease
+	os.Setenv("CNI_ARGS", "")
+	if err := ipam.ExecDel("host-local", getIPAMConfig(netInfo)); err != nil {
+		return fmt.Errorf("Failed to run CNI IPAM DEL: %v", err)
+	}
+
+	return nil
+}
+
+func main() {
+	addFunc := cmdAdd
+
+	// CNI doesn't yet have an UPDATE command, so fake it
+	cmd := os.Getenv("CNI_COMMAND")
+	if cmd == "UPDATE" {
+		addFunc = cmdUpdate
+		os.Setenv("CNI_COMMAND", "ADD")
+	}
+
+	skel.PluginMain(addFunc, cmdDel)
+}

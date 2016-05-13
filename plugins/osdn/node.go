@@ -2,16 +2,15 @@ package osdn
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
 	log "github.com/golang/glog"
 
 	"github.com/openshift/openshift-sdn/pkg/netutils"
-	"github.com/openshift/openshift-sdn/plugins/osdn/api"
 
 	osclient "github.com/openshift/origin/pkg/client"
-	osapi "github.com/openshift/origin/pkg/sdn/api"
 
 	kapi "k8s.io/kubernetes/pkg/api"
 	kclient "k8s.io/kubernetes/pkg/client/unversioned"
@@ -19,6 +18,8 @@ import (
 	knetwork "k8s.io/kubernetes/pkg/kubelet/network"
 	kexec "k8s.io/kubernetes/pkg/util/exec"
 	kubeutilnet "k8s.io/kubernetes/pkg/util/net"
+
+	cniinvoke "github.com/appc/cni/pkg/invoke"
 )
 
 type OsdnNode struct {
@@ -26,7 +27,6 @@ type OsdnNode struct {
 	registry           *Registry
 	podinfoServer      *PodInfoServer
 	localIP            string
-	localSubnet        *osapi.HostSubnet
 	hostName           string
 	podNetworkReady    chan struct{}
 	vnids              *vnidMap
@@ -37,7 +37,7 @@ type OsdnNode struct {
 }
 
 // Called by higher layers to create the plugin SDN node instance
-func NewNodePlugin(pluginName string, osClient *osclient.Client, kClient *kclient.Client, hostname string, selfIP string, iptablesSyncPeriod time.Duration, mtu uint) (api.OsdnNodePlugin, error) {
+func NewNodePlugin(pluginName string, osClient *osclient.Client, kClient *kclient.Client, hostname string, selfIP string, iptablesSyncPeriod time.Duration, mtu uint) (*OsdnNode, error) {
 	if !IsOpenShiftNetworkPlugin(pluginName) {
 		return nil, nil
 	}
@@ -98,7 +98,6 @@ func (node *OsdnNode) Start() error {
 	if err != nil {
 		return err
 	}
-	node.localSubnet = localSubnet
 
 	if node.multitenant {
 		if err := node.VnidStartNode(); err != nil {
@@ -126,6 +125,37 @@ func (node *OsdnNode) Start() error {
 	}
 
 	node.markPodNetworkReady()
+
+	return nil
+}
+
+
+func (plugin *OsdnNode) UpdatePod(namespace string, name string, id kubeletTypes.ContainerID) error {
+	const (
+		pluginPath = "/opt/cni/bin/openshift-sdn"
+		netConf = `{
+  "cniVersion": "0.1.0",
+  "name": "openshift-sdn",
+  "type": "openshift-sdn"
+}`
+	)
+
+	args := &cniinvoke.Args{
+		Command:     "UPDATE",
+		ContainerID: id.String(),
+		NetNS:       "/blahblah/foobar",  // plugin finds out namespace itself
+		PluginArgs:  [][2]string{
+			{"K8S_POD_NAMESPACE", namespace},
+			{"K8S_POD_NAME", name},
+			{"K8S_POD_INFRA_CONTAINER_ID", id.String()},
+		},
+		IfName:      "eth0",
+		Path:        filepath.Dir(pluginPath),
+	}
+
+	if _, err := cniinvoke.ExecPluginWithResult(pluginPath, []byte(netConf), args); err != nil {
+		return fmt.Errorf("failed to update pod network: %v", err)
+	}
 
 	return nil
 }
