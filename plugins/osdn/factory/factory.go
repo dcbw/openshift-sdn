@@ -24,9 +24,9 @@ func NewNodePlugin(pluginType string, osClient *osclient.Client, kClient *kclien
 
 func newPlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Client, hostname string, selfIP string) (api.OsdnPlugin, error) {
 	switch strings.ToLower(pluginType) {
-	case ovs.SingleTenantPluginName:
+	case api.SingleTenantPluginName:
 		return ovs.CreatePlugin(osdn.NewRegistry(osClient, kClient), false, hostname, selfIP)
-	case ovs.MultiTenantPluginName:
+	case api.MultiTenantPluginName:
 		return ovs.CreatePlugin(osdn.NewRegistry(osClient, kClient), true, hostname, selfIP)
 	}
 
@@ -36,7 +36,7 @@ func newPlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Cl
 // Call by higher layers to create the proxy plugin instance; only used by nodes
 func NewProxyPlugin(pluginType string, osClient *osclient.Client, kClient *kclient.Client) (api.FilteringEndpointsConfigHandler, error) {
 	switch strings.ToLower(pluginType) {
-	case ovs.MultiTenantPluginName:
+	case api.MultiTenantPluginName:
 		return ovs.CreateProxyPlugin(osdn.NewRegistry(osClient, kClient))
 	}
 
