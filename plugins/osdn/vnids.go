@@ -32,11 +32,11 @@ type vnidMap struct {
 	lock sync.Mutex
 }
 
-func newVnidMap() vnidMap {
-	return vnidMap{ids: make(map[string]uint)}
+func newVnidMap() *vnidMap {
+	return &vnidMap{ids: make(map[string]uint)}
 }
 
-func (vmap vnidMap) GetVNID(name string) (uint, error) {
+func (vmap *vnidMap) GetVNID(name string) (uint, error) {
 	vmap.lock.Lock()
 	defer vmap.lock.Unlock()
 
@@ -53,7 +53,7 @@ func (vmap vnidMap) GetVNID(name string) (uint, error) {
 // and if service/pod-setup tries to lookup vnid map then it may fail.
 // So, use this method to alleviate this problem. This method will
 // retry vnid lookup before giving up.
-func (vmap vnidMap) WaitAndGetVNID(name string) (uint, error) {
+func (vmap *vnidMap) WaitAndGetVNID(name string) (uint, error) {
 	// Try few times up to 2 seconds
 	retries := 20
 	retryInterval := 100 * time.Millisecond
@@ -68,7 +68,7 @@ func (vmap vnidMap) WaitAndGetVNID(name string) (uint, error) {
 	return MaxVNID + 1, fmt.Errorf("Failed to find netid for namespace: %s in vnid map", name)
 }
 
-func (vmap vnidMap) SetVNID(name string, id uint) {
+func (vmap *vnidMap) SetVNID(name string, id uint) {
 	vmap.lock.Lock()
 	defer vmap.lock.Unlock()
 
@@ -76,7 +76,7 @@ func (vmap vnidMap) SetVNID(name string, id uint) {
 	log.Infof("Associate netid %d to namespace %q", id, name)
 }
 
-func (vmap vnidMap) UnsetVNID(name string) (id uint, err error) {
+func (vmap *vnidMap) UnsetVNID(name string) (id uint, err error) {
 	vmap.lock.Lock()
 	defer vmap.lock.Unlock()
 
@@ -90,7 +90,7 @@ func (vmap vnidMap) UnsetVNID(name string) (id uint, err error) {
 	return id, nil
 }
 
-func (vmap vnidMap) CheckVNID(id uint) bool {
+func (vmap *vnidMap) CheckVNID(id uint) bool {
 	vmap.lock.Lock()
 	defer vmap.lock.Unlock()
 
@@ -102,7 +102,7 @@ func (vmap vnidMap) CheckVNID(id uint) bool {
 	return false
 }
 
-func (vmap vnidMap) GetAllocatedVNIDs() []uint {
+func (vmap *vnidMap) GetAllocatedVNIDs() []uint {
 	vmap.lock.Lock()
 	defer vmap.lock.Unlock()
 
@@ -119,7 +119,7 @@ func (vmap vnidMap) GetAllocatedVNIDs() []uint {
 	return ids
 }
 
-func (vmap vnidMap) PopulateVNIDs(registry *Registry) error {
+func (vmap *vnidMap) PopulateVNIDs(registry *Registry) error {
 	nets, err := registry.GetNetNamespaces()
 	if err != nil {
 		return err

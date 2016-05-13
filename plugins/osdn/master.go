@@ -18,7 +18,7 @@ import (
 type OsdnMaster struct {
 	registry        *Registry
 	subnetAllocator *netutils.SubnetAllocator
-	vnids           vnidMap
+	vnids           *vnidMap
 	netIDManager    *netutils.NetIDAllocator
 	adminNamespaces []string
 }

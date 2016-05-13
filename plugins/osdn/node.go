@@ -24,11 +24,12 @@ import (
 type OsdnNode struct {
 	multitenant        bool
 	registry           *Registry
+	podinfoServer      *PodInfoServer
 	localIP            string
 	localSubnet        *osapi.HostSubnet
 	hostName           string
 	podNetworkReady    chan struct{}
-	vnids              vnidMap
+	vnids              *vnidMap
 	iptablesSyncPeriod time.Duration
 	host               knetwork.Host
 	cniConfig          []byte
@@ -69,11 +70,16 @@ func NewNodePlugin(pluginName string, osClient *osclient.Client, kClient *kclien
 		registry:           newRegistry(osClient, kClient),
 		localIP:            selfIP,
 		hostName:           hostname,
-		vnids:              newVnidMap(),
 		podNetworkReady:    make(chan struct{}),
 		iptablesSyncPeriod: iptablesSyncPeriod,
 		mtu:                mtu,
 	}
+	if plugin.multitenant {
+		plugin.vnids = newVnidMap()
+	}
+
+	plugin.podinfoServer = NewPodInfoServer(plugin.registry, plugin.vnids, plugin.hostName)
+
 	return plugin, nil
 }
 
@@ -112,6 +118,11 @@ func (node *OsdnNode) Start() error {
 				log.Warningf("Could not update pod %q (%s): %s", p.Name, containerID, err)
 			}
 		}
+	}
+
+	if err := node.podinfoServer.Start(ni.ClusterNetwork.String(), localSubnet.Subnet, node.mtu); err != nil {
+		log.Errorf("Failed to start pod info server: %v", err)
+		return err
 	}
 
 	node.markPodNetworkReady()

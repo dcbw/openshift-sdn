@@ -96,7 +96,7 @@ func (plugin *OsdnNode) Capabilities() utilsets.Int {
 }
 
 func (plugin *OsdnNode) getVNID(namespace string) (string, error) {
-	if plugin.multitenant {
+	if plugin.vnids != nil {
 		vnid, err := plugin.vnids.WaitAndGetVNID(namespace)
 		if err != nil {
 			return "", err
