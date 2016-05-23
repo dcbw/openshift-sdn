@@ -69,9 +69,9 @@ func StartMaster(networkConfig osconfigapi.MasterNetworkConfig, osClient *osclie
 }
 
 func (oc *OsdnMaster) validateNetworkConfig(clusterNetwork, serviceNetwork *net.IPNet) error {
-	// TODO: Instead of hardcoding 'tun0' and 'lbr0', get it from common place.
+	// TODO: Instead of hardcoding 'tun0' get it from common place.
 	// This will ensure both the kube/multitenant scripts and master validations use the same name.
-	hostIPNets, err := netutils.GetHostIPNetworks([]string{"tun0", "lbr0"})
+	hostIPNets, err := netutils.GetHostIPNetworks([]string{"tun0"})
 	if err != nil {
 		return err
 	}

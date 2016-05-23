@@ -16,6 +16,7 @@ import (
 	kapi "k8s.io/kubernetes/pkg/api"
 	kclient "k8s.io/kubernetes/pkg/client/unversioned"
 	kubeletTypes "k8s.io/kubernetes/pkg/kubelet/container"
+	knetwork "k8s.io/kubernetes/pkg/kubelet/network"
 	utildbus "k8s.io/kubernetes/pkg/util/dbus"
 	kexec "k8s.io/kubernetes/pkg/util/exec"
 	"k8s.io/kubernetes/pkg/util/iptables"
@@ -30,6 +31,8 @@ type OsdnNode struct {
 	hostName        string
 	podNetworkReady chan struct{}
 	vnidMap         VNIDMap
+	host            knetwork.Host
+	cniConfig       []byte
 	mtu             uint
 }
 
