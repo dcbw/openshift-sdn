@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
@@ -15,6 +13,9 @@ import (
 
 	"github.com/openshift/openshift-sdn/plugins/osdn/api"
 
+	configapi "github.com/openshift/origin/pkg/cmd/server/api"
+	"github.com/openshift/origin/pkg/client"
+
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/ns"
 	"github.com/containernetworking/cni/pkg/ip"
@@ -23,6 +24,8 @@ import (
 	"github.com/vishvananda/netlink"
 
 	"k8s.io/kubernetes/pkg/api/resource"
+
+	kclient "k8s.io/kubernetes/pkg/client/unversioned"
 )
 
 const (
@@ -50,16 +53,18 @@ const (
 }`
 )
 
-func getNetworkInfo(client *http.Client) (*api.GetNetworkResponse, error) {
+func getNetworkInfo() (*api.GetNetworkResponse, error) {
 	// Try few times up to 15 seconds
 	retries := 150
 	retryInterval := 100 * time.Millisecond
 	for i := 0; i < retries; i++ {
 		network := &api.GetNetworkResponse{}
-		// HTTP client requires a URL including a domain part, but
-		// since we're talking to a unix socket the domain doesn't matter
-		if err := getUrl(client, "http://d/network", network); err == nil {
-			return network, nil
+
+		conf, err := ioutil.ReadFile(api.NodeConfigPath)
+		if err == nil {
+			if err := json.Unmarshal(conf, network); err == nil {
+				return network, nil
+			}
 		}
 		time.Sleep(retryInterval)
 	}
@@ -67,30 +72,7 @@ func getNetworkInfo(client *http.Client) (*api.GetNetworkResponse, error) {
 	return nil, fmt.Errorf("Timed out waiting for openshift to be ready")
 }
 
-func socketDial(proto, addr string) (conn net.Conn, err error) {
-    return net.Dial("unix", api.PodInfoSocketPath)
-}
-
-func getUrl(client *http.Client, url string, object interface{}) error {
-	resp, err := client.Get(url)
-	if err != nil {
-		return fmt.Errorf("Failed to retrieve %s: %v", url, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("Failed to read %s: %v", url, err)
-	}
-
-	if err := json.Unmarshal(body, object); err != nil {
-		return fmt.Errorf("Failed to read %s: %v", url, err)
-	}
-
-	return nil
-}
-
-func readPodInfo(client *http.Client, cniArgs string) (*api.GetPodResponse, error) {
+func readPodInfo(originClient *client.Client, kubeClient *kclient.Client, cniArgs string, multitenant bool) (*api.GetPodResponse, error) {
 	var namespace, name string
 	for _, arg := range strings.Split(cniArgs, ";") {
 		parts := strings.Split(arg, "=")
@@ -110,11 +92,29 @@ func readPodInfo(client *http.Client, cniArgs string) (*api.GetPodResponse, erro
 	}
 
 	info := &api.GetPodResponse{}
-	url := fmt.Sprintf("http://d/pods/%s/%s", namespace, name)
-	if err := getUrl(client, url, info); err != nil {
-		return nil, err
+
+	if multitenant {
+		netNamespace, err := originClient.NetNamespaces().Get(namespace)
+		if err != nil {
+			return nil, err
+		}
+		info.Vnid = netNamespace.NetID
 	}
 
+	// FIXME: does this ensure the returned pod lives on this node?
+	pod, err := kubeClient.Pods(namespace).Get(name)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to read pod %s/%s: %v", err)
+	}
+
+	for _, container := range pod.Spec.Containers {
+		if container.SecurityContext.Privileged != nil && *container.SecurityContext.Privileged {
+			info.Privileged = true
+			break
+		}
+	}
+
+	info.Annotations = pod.Annotations
 	return info, nil
 }
 
@@ -161,10 +161,10 @@ func getBandwidth(podInfo *api.GetPodResponse) (string, string, error) {
 	}
 	var ingressStr, egressStr string
 	if ingress != nil {
-		ingressStr = fmt.Sprintf("%d", ingress)
+		ingressStr = fmt.Sprintf("%d", ingress.Value())
 	}
 	if egress != nil {
-		egressStr = fmt.Sprintf("%d", egress)
+		egressStr = fmt.Sprintf("%d", egress.Value())
 	}
 	return ingressStr, egressStr, nil
 }
@@ -180,19 +180,27 @@ func wantsMacvlan(podInfo *api.GetPodResponse) (bool, error) {
 	return false, fmt.Errorf("Pod has %q annotation but is not privileged", AssignMacVlanAnnotation)
 }
 
-func getPodInfo(cniArgs string) (*api.GetNetworkResponse, string, string, string, bool, error) {
-	// Wait for openshift to be ready
-	client := &http.Client{
-		Transport: &http.Transport{
-			Dial: socketDial,
-		},
-	}
-	netInfo, err := getNetworkInfo(client)
+func getPodInfo(args *skel.CmdArgs) (*api.GetNetworkResponse, string, string, string, bool, error) {
+	n, err := loadNetConf(args.StdinData)
 	if err != nil {
 		return nil, "", "", "", false, err
 	}
 
-	podInfo, err := readPodInfo(client, cniArgs)
+	originClient, _, err := configapi.GetOpenShiftClient(n.MasterKubeConfig)
+	if err != nil {
+		return nil, "", "", "", false, err
+	}
+	kubeClient, _, err := configapi.GetKubeClient(n.MasterKubeConfig)
+	if err != nil {
+		return nil, "", "", "", false, err
+	}
+
+	netInfo, err := getNetworkInfo()
+	if err != nil {
+		return nil, "", "", "", false, err
+	}
+
+	podInfo, err := readPodInfo(originClient, kubeClient, args.Args, netInfo.Multitenant)
 	if err != nil {
 		return nil, "", "", "", false, err
 	}
@@ -325,8 +333,16 @@ func getScriptError(output []byte) string {
 	return string(output)
 }
 
+func loadNetConf(bytes []byte) (*api.SDNNetConf, error) {
+	n := &api.SDNNetConf{}
+	if err := json.Unmarshal(bytes, n); err != nil {
+		return nil, fmt.Errorf("failed to load netconf: %v", err)
+	}
+	return n, nil
+}
+
 func cmdAdd(args *skel.CmdArgs) error {
-	netInfo, vnid, ingress, egress, macvlan, err := getPodInfo(args.Args)
+	netInfo, vnid, ingress, egress, macvlan, err := getPodInfo(args)
 	if err != nil {
 		return err
 	}
@@ -387,7 +403,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	out, err := exec.Command(sdnScript, setUpCmd, hostVeth.Attrs().Name, contVethMac, podIP, vnid, ingress, egress).CombinedOutput()
 	if isScriptError(err) {
 		ipam.ExecDel("host-local", ipamConfig)
-		return fmt.Errorf("Error running network setup script: %s", getScriptError(out))
+		return fmt.Errorf("Error running network setup script:\nhostVethName %s, contVethMac %s, podIP %s, vnid %s, ingress %s, egress %s\n %s", hostVeth.Attrs().Name, contVethMac, podIP, vnid, ingress, egress, out)
 	} else if err != nil {
 		ipam.ExecDel("host-local", ipamConfig)
 		return err
@@ -397,7 +413,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 }
 
 func cmdUpdate(args *skel.CmdArgs) error {
-	_, vnid, ingress, egress, _, err := getPodInfo(args.Args)
+	_, vnid, ingress, egress, _, err := getPodInfo(args)
 	if err != nil {
 		return err
 	}
@@ -420,7 +436,7 @@ func cmdUpdate(args *skel.CmdArgs) error {
 
 
 func cmdDel(args *skel.CmdArgs) error {
-	netInfo, _, _, _, _, err := getPodInfo(args.Args)
+	netInfo, _, _, _, _, err := getPodInfo(args)
 	if err != nil {
 		return err
 	}

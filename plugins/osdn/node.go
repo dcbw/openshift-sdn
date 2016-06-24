@@ -5,12 +5,19 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"os"
+	"io/ioutil"
+	"net"
+	"encoding/json"
+	"path"
 
 	log "github.com/golang/glog"
 
 	"github.com/openshift/openshift-sdn/pkg/netutils"
+	"github.com/openshift/openshift-sdn/plugins/osdn/api"
 
 	osclient "github.com/openshift/origin/pkg/client"
+	osapi "github.com/openshift/origin/pkg/sdn/api"
 
 	kapi "k8s.io/kubernetes/pkg/api"
 	kclient "k8s.io/kubernetes/pkg/client/unversioned"
@@ -20,12 +27,12 @@ import (
 	kubeutilnet "k8s.io/kubernetes/pkg/util/net"
 
 	cniinvoke "github.com/appc/cni/pkg/invoke"
+	cnitypes "github.com/containernetworking/cni/pkg/types"
 )
 
 type OsdnNode struct {
 	multitenant        bool
 	registry           *Registry
-	podinfoServer      *PodInfoServer
 	localIP            string
 	hostName           string
 	podNetworkReady    chan struct{}
@@ -37,7 +44,7 @@ type OsdnNode struct {
 }
 
 // Called by higher layers to create the plugin SDN node instance
-func NewNodePlugin(pluginName string, osClient *osclient.Client, kClient *kclient.Client, hostname string, selfIP string, iptablesSyncPeriod time.Duration, mtu uint) (*OsdnNode, error) {
+func NewNodePlugin(pluginName string, osClient *osclient.Client, kClient *kclient.Client, hostname string, selfIP string, iptablesSyncPeriod time.Duration, mtu uint, masterKubeConfig string) (*OsdnNode, error) {
 	if !IsOpenShiftNetworkPlugin(pluginName) {
 		return nil, nil
 	}
@@ -65,6 +72,10 @@ func NewNodePlugin(pluginName string, osClient *osclient.Client, kClient *kclien
 		}
 	}
 
+	if err := writeCNIConfig(masterKubeConfig, IsOpenShiftMultitenantNetworkPlugin(pluginName)); err != nil {
+		return nil, err
+	}
+
 	plugin := &OsdnNode{
 		multitenant:        IsOpenShiftMultitenantNetworkPlugin(pluginName),
 		registry:           newRegistry(osClient, kClient),
@@ -78,9 +89,58 @@ func NewNodePlugin(pluginName string, osClient *osclient.Client, kClient *kclien
 		plugin.vnids = newVnidMap()
 	}
 
-	plugin.podinfoServer = NewPodInfoServer(plugin.registry, plugin.vnids, plugin.hostName)
-
 	return plugin, nil
+}
+
+func writeCNIConfig(masterKubeConfig string, multitenant bool) error {
+	cniConfig, err := json.Marshal(&api.SDNNetConf{
+		NetConf: cnitypes.NetConf{
+			Name: "openshift-sdn",
+			Type: "openshift-sdn",
+		},
+		MasterKubeConfig: masterKubeConfig,
+		Multitenant:      multitenant,
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll("/etc/cni/net.d", 0700); err != nil {
+		return fmt.Errorf("failed to create CNI config directory: %v", err)
+	}
+
+	if err := ioutil.WriteFile("/etc/cni/net.d/80-openshift-sdn.conf", []byte(cniConfig), 0700); err != nil {
+		return fmt.Errorf("failed to create CNI config file: %v", err)
+	}
+
+	return nil
+}
+
+func writeNodeConfig(ni *NetworkInfo, localSubnet *osapi.HostSubnet, mtu uint) error {
+	_, ipnet, err := net.ParseCIDR(localSubnet.Subnet)
+	nodeConfig, err := json.Marshal(&api.GetNetworkResponse{
+		ClusterNetwork: ni.ClusterNetwork.String(),
+		NodeNetwork:    localSubnet.Subnet,
+		NodeGateway:    netutils.GenerateDefaultGateway(ipnet).String(),
+		MTU:            mtu,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal node config: %v", err)
+	}
+
+	dirName := path.Dir(api.NodeConfigPath)
+	if err := os.RemoveAll(dirName); err != nil {
+		return fmt.Errorf("failed to removing openshift-sdn run directory: %v", err)
+	}
+	if err := os.MkdirAll(dirName, 0700); err != nil {
+		return fmt.Errorf("failed to create openshift-sdn run directory: %v", err)
+	}
+
+	if err := ioutil.WriteFile(api.NodeConfigPath, nodeConfig, 0400); err != nil {
+		return fmt.Errorf("failed to create node config file: %v", err)
+	}
+
+	return nil
 }
 
 func (node *OsdnNode) Start() error {
@@ -96,6 +156,10 @@ func (node *OsdnNode) Start() error {
 
 	networkChanged, localSubnet, err := node.SubnetStartNode(node.mtu)
 	if err != nil {
+		return err
+	}
+
+	if err := writeNodeConfig(ni, localSubnet, node.mtu); err != nil {
 		return err
 	}
 
@@ -117,11 +181,6 @@ func (node *OsdnNode) Start() error {
 				log.Warningf("Could not update pod %q (%s): %s", p.Name, containerID, err)
 			}
 		}
-	}
-
-	if err := node.podinfoServer.Start(ni.ClusterNetwork.String(), localSubnet.Subnet, node.mtu); err != nil {
-		log.Errorf("Failed to start pod info server: %v", err)
-		return err
 	}
 
 	node.markPodNetworkReady()

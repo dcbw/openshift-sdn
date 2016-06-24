@@ -6,7 +6,7 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path"
+//	"path"
 
 	"github.com/gorilla/mux"
 
@@ -52,15 +52,6 @@ func (s *PodInfoServer) Start(clusterNetworkCIDR, localSubnetCIDR string, mtu ui
 	_, ipnet, err := net.ParseCIDR(localSubnetCIDR)
 	s.nodeGateway = netutils.GenerateDefaultGateway(ipnet).String()
 	s.mtu = mtu
-
-	// Remove and re-create the socket directory with root-only permissions
-	dirName := path.Dir(api.PodInfoSocketPath)
-	if err := os.RemoveAll(dirName); err != nil {
-		return fmt.Errorf("failed to removing old pod info socket: %v", err)
-	}
-	if err := os.MkdirAll(dirName, 0700); err != nil {
-		return fmt.Errorf("failed to create pod info socket directory: %v", err)
-	}
 
 	// On Linux the socket is created with the permissions of the directory
 	// it is in, so as long as the directory is root-only we can avoid
